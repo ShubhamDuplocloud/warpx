@@ -144,7 +144,7 @@ jobs:
         run: |
           echo "Checking for READY nodes with label: ${{ env.TARGET_NODE_LABEL }}..."
 
-          # We use || true here to prevent grep failure (exit 1) from killing script if no lines match
+          # Use || true to prevent exit 1 if grep finds nothing
           NODE_COUNT=$(kubectl get nodes -l ${{ env.TARGET_NODE_LABEL }} --no-headers 2>/dev/null | grep -w "Ready" | wc -l)
 
           echo "Found $NODE_COUNT ready nodes."
@@ -169,7 +169,7 @@ jobs:
           echo "Job Name: ${{ inputs.job_name }}"
           echo "Output Dir: $OUTPUT_DIR"
 
-          # Auto-Delete Old Job Instead of Failing
+          # Auto-Delete Old Job
           if kubectl get mpijob ${{ inputs.job_name }} -n duploservices-dev > /dev/null 2>&1; then
             echo "⚠️  Found existing job '${{ inputs.job_name }}'. Deleting it to start fresh..."
             kubectl delete mpijob ${{ inputs.job_name }} -n duploservices-dev --timeout=30s
@@ -181,7 +181,7 @@ jobs:
           # Prepare File
           cp $TEMPLATE_FILE $FINAL_MANIFEST
 
-          # Replace Placeholders (Using {{ }} to match your uploaded files)
+          # Replace Placeholders
           sed -i "s/{{JOB_NAME}}/${{ inputs.job_name }}/g" $FINAL_MANIFEST
           sed -i "s|{{OUTPUT_DIR}}|$OUTPUT_DIR|g" $FINAL_MANIFEST
 
@@ -202,7 +202,7 @@ jobs:
           kubectl get pods -n duploservices-dev -l training.kubeflow.org/job-name=${{ inputs.job_name }}
 
       # ---------------------------------------------------------
-      # STEP 3: Wait for Completion (FIXED INCREMENT ERROR)
+      # STEP 3: Wait for Completion (FIXED POD DETECTION)
       # ---------------------------------------------------------
       - name: Wait for Simulation Completion
         run: |
@@ -212,19 +212,26 @@ jobs:
 
           echo "Waiting for Launcher pod to initiate..."
 
-          # Wait loop to ensure the pod exists before we track it
           MAX_RETRIES=30
           COUNTER=0
           LAUNCHER_POD=""
 
           until [ ! -z "$LAUNCHER_POD" ] || [ $COUNTER -eq $MAX_RETRIES ]; do
-             # Prevent exit 1 if pod not found
-             LAUNCHER_POD=$(kubectl get pods -n $NAMESPACE -l training.kubeflow.org/job-name=$JOB_NAME,training.kubeflow.org/replica-type=Launcher -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+             # FIX: Fetch ALL pods for the job, then grep for the one named 'launcher'
+             # This bypasses potential label mismatch issues (Launcher vs launcher)
+             ALL_PODS=$(kubectl get pods -n $NAMESPACE -l training.kubeflow.org/job-name=$JOB_NAME -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || true)
              
+             # Find the pod name containing 'launcher'
+             for pod in $ALL_PODS; do
+               if [[ "$pod" == *"launcher"* ]]; then
+                 LAUNCHER_POD=$pod
+                 break
+               fi
+             done
+
              if [ -z "$LAUNCHER_POD" ]; then
-                echo "Pod not found yet... retrying ($COUNTER/$MAX_RETRIES)"
+                echo "Launcher pod not found yet... retrying ($COUNTER/$MAX_RETRIES)"
                 sleep 2
-                # FIX: Use standard math assignment to avoid exit code 1 when counter is 0
                 COUNTER=$((COUNTER+1))
              fi
           done
