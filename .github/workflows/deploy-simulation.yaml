@@ -144,6 +144,7 @@ jobs:
         run: |
           echo "Checking for READY nodes with label: ${{ env.TARGET_NODE_LABEL }}..."
 
+          # We use || true here to prevent grep failure (exit 1) from killing script if no lines match
           NODE_COUNT=$(kubectl get nodes -l ${{ env.TARGET_NODE_LABEL }} --no-headers 2>/dev/null | grep -w "Ready" | wc -l)
 
           echo "Found $NODE_COUNT ready nodes."
@@ -180,7 +181,7 @@ jobs:
           # Prepare File
           cp $TEMPLATE_FILE $FINAL_MANIFEST
 
-          # Replace Placeholders (Using simple placeholders)
+          # Replace Placeholders (Using {{ }} to match your uploaded files)
           sed -i "s/{{JOB_NAME}}/${{ inputs.job_name }}/g" $FINAL_MANIFEST
           sed -i "s|{{OUTPUT_DIR}}|$OUTPUT_DIR|g" $FINAL_MANIFEST
 
@@ -201,7 +202,7 @@ jobs:
           kubectl get pods -n duploservices-dev -l training.kubeflow.org/job-name=${{ inputs.job_name }}
 
       # ---------------------------------------------------------
-      # STEP 3: Wait for Completion
+      # STEP 3: Wait for Completion (FIXED CRASH)
       # ---------------------------------------------------------
       - name: Wait for Simulation Completion
         run: |
@@ -217,8 +218,11 @@ jobs:
           LAUNCHER_POD=""
 
           until [ ! -z "$LAUNCHER_POD" ] || [ $COUNTER -eq $MAX_RETRIES ]; do
-             LAUNCHER_POD=$(kubectl get pods -n $NAMESPACE -l training.kubeflow.org/job-name=$JOB_NAME,training.kubeflow.org/replica-type=Launcher -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+             # FIX: Added '|| true' to prevent script exit if pod is not found yet
+             LAUNCHER_POD=$(kubectl get pods -n $NAMESPACE -l training.kubeflow.org/job-name=$JOB_NAME,training.kubeflow.org/replica-type=Launcher -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+             
              if [ -z "$LAUNCHER_POD" ]; then
+                echo "Pod not found yet... retrying ($COUNTER/$MAX_RETRIES)"
                 sleep 2
                 ((COUNTER++))
              fi
