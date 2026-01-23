@@ -1,3 +1,93 @@
+# name: Deploy WarpX Simulation
+
+# on:
+#   workflow_dispatch:
+#     inputs:
+#       simulation_type:
+#         description: "Simulation Type"
+#         required: true
+#         default: "2d"
+#         type: choice
+#         options:
+#           - "2d"
+#           - "3d"
+#       job_name:
+#         description: "Unique Job Name (e.g., run-001)"
+#         required: true
+#         default: "warpx-run-1"
+
+# permissions:
+#   id-token: write # Required for OIDC
+#   contents: read # Required to checkout code
+
+# env:
+#   AWS_REGION: us-east-2 # <--- UPDATE THIS
+#   EKS_CLUSTER_NAME: duploinfra-dev # <--- UPDATE THIS
+#   IAM_ROLE_ARN: arn:aws:iam::359835242613:role/GitHubAction-EKS-Deployer # <--- UPDATE THIS
+
+# jobs:
+#   deploy:
+#     runs-on: ubuntu-latest
+#     steps:
+#       - name: Checkout Code
+#         uses: actions/checkout@v3
+
+#       - name: Configure AWS Credentials
+#         uses: aws-actions/configure-aws-credentials@v4
+#         with:
+#           role-to-assume: ${{ env.IAM_ROLE_ARN }}
+#           aws-region: ${{ env.AWS_REGION }}
+
+#       - name: Update Kubeconfig
+#         run: |
+#           aws eks update-kubeconfig --name ${{ env.EKS_CLUSTER_NAME }} --region ${{ env.AWS_REGION }}
+
+#       - name: Prepare Manifest
+#         run: |
+#           echo "Preparing ${{ inputs.simulation_type }} simulation..."
+
+#           # Select the correct template
+#           TEMPLATE_FILE="k8s-manifests/warpx-${{ inputs.simulation_type }}.yaml"
+#           FINAL_MANIFEST="final-deployment.yaml"
+
+#           # Define Output Directory Name
+#           OUTPUT_DIR="output_${{ inputs.simulation_type }}_${{ inputs.job_name }}"
+
+#           echo "Job Name: ${{ inputs.job_name }}"
+#           echo "Output Dir: $OUTPUT_DIR"
+
+#           # Replace Placeholders using sed
+#           # We check if the job name already exists to avoid conflicts
+#           if kubectl get mpijob ${{ inputs.job_name }} -n duploservices-dev > /dev/null 2>&1; then
+#             echo "::error::Job '${{ inputs.job_name }}' already exists! Please choose a unique name."
+#             exit 1
+#           fi
+
+#           cp $TEMPLATE_FILE $FINAL_MANIFEST
+
+#           # Replace {{JOB_NAME}}
+#           sed -i "s/{{JOB_NAME}}/${{ inputs.job_name }}/g" $FINAL_MANIFEST
+
+#           # Replace {{OUTPUT_DIR}}
+#           sed -i "s/{{OUTPUT_DIR}}/$OUTPUT_DIR/g" $FINAL_MANIFEST
+
+#           echo "Manifest generated successfully."
+#           cat $FINAL_MANIFEST
+
+#       - name: Debug Identity
+#         run: aws sts get-caller-identity
+
+#       - name: Deploy to EKS
+#         run: |
+#           kubectl apply -f final-deployment.yaml --validate=false
+#           echo "Deployment submitted!"
+
+#       - name: Monitor Status (Optional)
+#         run: |
+#           echo "Waiting for Launcher pod to start..."
+#           sleep 2
+#           kubectl get pods -n duploservices-dev -l training.kubeflow.org/job-name=${{ inputs.job_name }}
+
 name: Deploy WarpX Simulation
 
 on:
@@ -15,15 +105,22 @@ on:
         description: "Unique Job Name (e.g., run-001)"
         required: true
         default: "warpx-run-1"
+      # ADDED: Input for timeout control
+      timeout:
+        description: "Timeout in seconds (Default: 3600)"
+        required: false
+        default: "3600"
 
 permissions:
   id-token: write # Required for OIDC
   contents: read # Required to checkout code
 
 env:
-  AWS_REGION: us-east-2 # <--- UPDATE THIS
-  EKS_CLUSTER_NAME: duploinfra-dev # <--- UPDATE THIS
-  IAM_ROLE_ARN: arn:aws:iam::359835242613:role/GitHubAction-EKS-Deployer # <--- UPDATE THIS
+  AWS_REGION: us-east-2
+  EKS_CLUSTER_NAME: duploinfra-dev
+  IAM_ROLE_ARN: arn:aws:iam::359835242613:role/GitHubAction-EKS-Deployer
+  # ADDED: Define the label for the node check
+  TARGET_NODE_LABEL: "node.kubernetes.io/instance-type=g5.12xlarge"
 
 jobs:
   deploy:
@@ -42,6 +139,27 @@ jobs:
         run: |
           aws eks update-kubeconfig --name ${{ env.EKS_CLUSTER_NAME }} --region ${{ env.AWS_REGION }}
 
+      # ---------------------------------------------------------
+      # NEW STEP 1: Node Availability Check
+      # ---------------------------------------------------------
+      - name: Check Node Availability
+        run: |
+          echo "Checking for READY nodes with label: ${{ env.TARGET_NODE_LABEL }}..."
+
+          # Count nodes that match the label AND are in 'Ready' state
+          NODE_COUNT=$(kubectl get nodes -l ${{ env.TARGET_NODE_LABEL }} --no-headers 2>/dev/null | grep -w "Ready" | wc -l)
+
+          echo "Found $NODE_COUNT ready nodes."
+
+          if [ "$NODE_COUNT" -eq "0" ]; then
+            echo "::error::No READY nodes found with label ${{ env.TARGET_NODE_LABEL }}. Cannot schedule simulation."
+            exit 1
+          fi
+          echo "Node check passed. Proceeding with deployment."
+
+      # ---------------------------------------------------------
+      # EXISTING LOGIC (Unchanged)
+      # ---------------------------------------------------------
       - name: Prepare Manifest
         run: |
           echo "Preparing ${{ inputs.simulation_type }} simulation..."
@@ -69,7 +187,7 @@ jobs:
           sed -i "s/{{JOB_NAME}}/${{ inputs.job_name }}/g" $FINAL_MANIFEST
 
           # Replace {{OUTPUT_DIR}}
-          sed -i "s/{{OUTPUT_DIR}}/$OUTPUT_DIR/g" $FINAL_MANIFEST
+          sed -i "s|{{OUTPUT_DIR}}|$OUTPUT_DIR|g" $FINAL_MANIFEST
 
           echo "Manifest generated successfully."
           cat $FINAL_MANIFEST
@@ -82,8 +200,63 @@ jobs:
           kubectl apply -f final-deployment.yaml --validate=false
           echo "Deployment submitted!"
 
-      - name: Monitor Status (Optional)
+      - name: Monitor Status (Quick Check)
         run: |
           echo "Waiting for Launcher pod to start..."
-          sleep 2
+          sleep 5
           kubectl get pods -n duploservices-dev -l training.kubeflow.org/job-name=${{ inputs.job_name }}
+
+      # ---------------------------------------------------------
+      # NEW STEP 2: Wait for Completion
+      # ---------------------------------------------------------
+      - name: Wait for Simulation Completion
+        run: |
+          JOB_NAME="${{ inputs.job_name }}"
+          NAMESPACE="duploservices-dev"
+          TIMEOUT="${{ inputs.timeout }}"
+
+          echo "Waiting for Launcher pod to initiate..."
+
+          # Wait loop to ensure the pod exists before we track it
+          MAX_RETRIES=30
+          COUNTER=0
+          LAUNCHER_POD=""
+
+          until [ ! -z "$LAUNCHER_POD" ] || [ $COUNTER -eq $MAX_RETRIES ]; do
+             LAUNCHER_POD=$(kubectl get pods -n $NAMESPACE -l training.kubeflow.org/job-name=$JOB_NAME,training.kubeflow.org/replica-type=Launcher -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+             if [ -z "$LAUNCHER_POD" ]; then
+                sleep 2
+                ((COUNTER++))
+             fi
+          done
+
+          if [ -z "$LAUNCHER_POD" ]; then
+             echo "::error::Launcher pod was not created within 60 seconds. Check MPIOperator logs."
+             exit 1
+          fi
+
+          echo "Tracking Pod: $LAUNCHER_POD"
+
+          START_TIME=$(date +%s)
+
+          # Polling loop
+          while true; do
+            PHASE=$(kubectl get pod $LAUNCHER_POD -n $NAMESPACE -o jsonpath='{.status.phase}')
+            CURRENT_TIME=$(date +%s)
+            ELAPSED=$(( CURRENT_TIME - START_TIME ))
+            
+            if [ "$PHASE" == "Succeeded" ]; then
+               echo "✅ Simulation Completed Successfully!"
+               break
+            elif [ "$PHASE" == "Failed" ]; then
+               echo "::error::❌ Simulation Failed!"
+               kubectl logs $LAUNCHER_POD -n $NAMESPACE --tail=50
+               exit 1
+            elif [ $ELAPSED -gt $TIMEOUT ]; then
+               echo "::error::⏰ Simulation Timed Out after $TIMEOUT seconds."
+               exit 1
+            fi
+            
+            echo "[$ELAPSED s] Status: $PHASE..."
+            sleep 15
+          done
