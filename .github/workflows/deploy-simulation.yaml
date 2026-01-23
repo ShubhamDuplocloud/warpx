@@ -169,7 +169,7 @@ jobs:
           echo "Job Name: ${{ inputs.job_name }}"
           echo "Output Dir: $OUTPUT_DIR"
 
-          # --- FIX: Auto-Delete Old Job Instead of Failing ---
+          # Auto-Delete Old Job Instead of Failing
           if kubectl get mpijob ${{ inputs.job_name }} -n duploservices-dev > /dev/null 2>&1; then
             echo "⚠️  Found existing job '${{ inputs.job_name }}'. Deleting it to start fresh..."
             kubectl delete mpijob ${{ inputs.job_name }} -n duploservices-dev --timeout=30s
@@ -202,7 +202,7 @@ jobs:
           kubectl get pods -n duploservices-dev -l training.kubeflow.org/job-name=${{ inputs.job_name }}
 
       # ---------------------------------------------------------
-      # STEP 3: Wait for Completion (FIXED CRASH)
+      # STEP 3: Wait for Completion (FIXED INCREMENT ERROR)
       # ---------------------------------------------------------
       - name: Wait for Simulation Completion
         run: |
@@ -218,13 +218,14 @@ jobs:
           LAUNCHER_POD=""
 
           until [ ! -z "$LAUNCHER_POD" ] || [ $COUNTER -eq $MAX_RETRIES ]; do
-             # FIX: Added '|| true' to prevent script exit if pod is not found yet
+             # Prevent exit 1 if pod not found
              LAUNCHER_POD=$(kubectl get pods -n $NAMESPACE -l training.kubeflow.org/job-name=$JOB_NAME,training.kubeflow.org/replica-type=Launcher -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
              
              if [ -z "$LAUNCHER_POD" ]; then
                 echo "Pod not found yet... retrying ($COUNTER/$MAX_RETRIES)"
                 sleep 2
-                ((COUNTER++))
+                # FIX: Use standard math assignment to avoid exit code 1 when counter is 0
+                COUNTER=$((COUNTER+1))
              fi
           done
 
