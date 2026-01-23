@@ -144,7 +144,7 @@ jobs:
         run: |
           echo "Checking for READY nodes with label: ${{ env.TARGET_NODE_LABEL }}..."
 
-          # Use || true to prevent exit 1 if grep finds nothing
+          # Use || true to prevent grep failure (exit 1) if no nodes found
           NODE_COUNT=$(kubectl get nodes -l ${{ env.TARGET_NODE_LABEL }} --no-headers 2>/dev/null | grep -w "Ready" | wc -l)
 
           echo "Found $NODE_COUNT ready nodes."
@@ -182,8 +182,8 @@ jobs:
           cp $TEMPLATE_FILE $FINAL_MANIFEST
 
           # Replace Placeholders
-          sed -i "s/{{JOB_NAME}}/${{ inputs.job_name }}/g" $FINAL_MANIFEST
-          sed -i "s|{{OUTPUT_DIR}}|$OUTPUT_DIR|g" $FINAL_MANIFEST
+          sed -i "s/__JOB_NAME__/${{ inputs.job_name }}/g" $FINAL_MANIFEST
+          sed -i "s|__OUTPUT_DIR__|$OUTPUT_DIR|g" $FINAL_MANIFEST
 
           echo "Manifest generated successfully."
 
@@ -202,7 +202,7 @@ jobs:
           kubectl get pods -n duploservices-dev -l training.kubeflow.org/job-name=${{ inputs.job_name }}
 
       # ---------------------------------------------------------
-      # STEP 3: Wait for Completion (FIXED POD DETECTION)
+      # STEP 3: Wait for Completion (Fixed Logic & Logging)
       # ---------------------------------------------------------
       - name: Wait for Simulation Completion
         run: |
@@ -217,11 +217,8 @@ jobs:
           LAUNCHER_POD=""
 
           until [ ! -z "$LAUNCHER_POD" ] || [ $COUNTER -eq $MAX_RETRIES ]; do
-             # FIX: Fetch ALL pods for the job, then grep for the one named 'launcher'
-             # This bypasses potential label mismatch issues (Launcher vs launcher)
+             # Find pod with 'launcher' in name to handle label mismatches
              ALL_PODS=$(kubectl get pods -n $NAMESPACE -l training.kubeflow.org/job-name=$JOB_NAME -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || true)
-             
-             # Find the pod name containing 'launcher'
              for pod in $ALL_PODS; do
                if [[ "$pod" == *"launcher"* ]]; then
                  LAUNCHER_POD=$pod
@@ -242,27 +239,35 @@ jobs:
           fi
 
           echo "Tracking Pod: $LAUNCHER_POD"
-
           START_TIME=$(date +%s)
 
           # Polling loop
           while true; do
-            PHASE=$(kubectl get pod $LAUNCHER_POD -n $NAMESPACE -o jsonpath='{.status.phase}')
+            # Fetch Pod Phase
+            PHASE=$(kubectl get pod $LAUNCHER_POD -n $NAMESPACE -o jsonpath='{.status.phase}' 2>/dev/null || echo "Unknown")
+            
+            # Fetch Job Status (Fallback in case pod is deleted quickly)
+            JOB_SUCCEEDED=$(kubectl get mpijob $JOB_NAME -n $NAMESPACE -o jsonpath='{.status.conditions[?(@.type=="Succeeded")].status}' 2>/dev/null || echo "False")
+
             CURRENT_TIME=$(date +%s)
             ELAPSED=$(( CURRENT_TIME - START_TIME ))
             
-            if [ "$PHASE" == "Succeeded" ]; then
+            echo "[$ELAPSED s] Pod Phase: $PHASE"
+
+            # Check for Success
+            if [ "$PHASE" == "Succeeded" ] || [ "$JOB_SUCCEEDED" == "True" ]; then
                echo "✅ Simulation Completed Successfully!"
+               # Sleep to ensure logs flush before exit
+               sleep 5
                break
             elif [ "$PHASE" == "Failed" ]; then
                echo "::error::❌ Simulation Failed!"
-               kubectl logs $LAUNCHER_POD -n $NAMESPACE --tail=50
+               kubectl logs $LAUNCHER_POD -n $NAMESPACE --tail=50 || true
                exit 1
             elif [ $ELAPSED -gt $TIMEOUT ]; then
                echo "::error::⏰ Simulation Timed Out after $TIMEOUT seconds."
                exit 1
             fi
             
-            echo "[$ELAPSED s] Status: $PHASE..."
-            sleep 15
+            sleep 10
           done
