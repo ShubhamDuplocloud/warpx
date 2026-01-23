@@ -105,7 +105,6 @@ on:
         description: "Unique Job Name (e.g., run-001)"
         required: true
         default: "warpx-run-1"
-      # ADDED: Input for timeout control
       timeout:
         description: "Timeout in seconds (Default: 3600)"
         required: false
@@ -119,7 +118,6 @@ env:
   AWS_REGION: us-east-2
   EKS_CLUSTER_NAME: duploinfra-dev
   IAM_ROLE_ARN: arn:aws:iam::359835242613:role/GitHubAction-EKS-Deployer
-  # ADDED: Define the label for the node check
   TARGET_NODE_LABEL: "node.kubernetes.io/instance-type=g5.12xlarge"
 
 jobs:
@@ -140,13 +138,12 @@ jobs:
           aws eks update-kubeconfig --name ${{ env.EKS_CLUSTER_NAME }} --region ${{ env.AWS_REGION }}
 
       # ---------------------------------------------------------
-      # NEW STEP 1: Node Availability Check
+      # STEP 1: Node Availability Check
       # ---------------------------------------------------------
       - name: Check Node Availability
         run: |
           echo "Checking for READY nodes with label: ${{ env.TARGET_NODE_LABEL }}..."
 
-          # Count nodes that match the label AND are in 'Ready' state
           NODE_COUNT=$(kubectl get nodes -l ${{ env.TARGET_NODE_LABEL }} --no-headers 2>/dev/null | grep -w "Ready" | wc -l)
 
           echo "Found $NODE_COUNT ready nodes."
@@ -158,39 +155,36 @@ jobs:
           echo "Node check passed. Proceeding with deployment."
 
       # ---------------------------------------------------------
-      # EXISTING LOGIC (Unchanged)
+      # STEP 2: Prepare & Cleanup
       # ---------------------------------------------------------
       - name: Prepare Manifest
         run: |
           echo "Preparing ${{ inputs.simulation_type }} simulation..."
 
-          # Select the correct template
           TEMPLATE_FILE="k8s-manifests/warpx-${{ inputs.simulation_type }}.yaml"
           FINAL_MANIFEST="final-deployment.yaml"
-
-          # Define Output Directory Name
           OUTPUT_DIR="output_${{ inputs.simulation_type }}_${{ inputs.job_name }}"
 
           echo "Job Name: ${{ inputs.job_name }}"
           echo "Output Dir: $OUTPUT_DIR"
 
-          # Replace Placeholders using sed
-          # We check if the job name already exists to avoid conflicts
+          # --- FIX: Auto-Delete Old Job Instead of Failing ---
           if kubectl get mpijob ${{ inputs.job_name }} -n duploservices-dev > /dev/null 2>&1; then
-            echo "::error::Job '${{ inputs.job_name }}' already exists! Please choose a unique name."
-            exit 1
+            echo "⚠️  Found existing job '${{ inputs.job_name }}'. Deleting it to start fresh..."
+            kubectl delete mpijob ${{ inputs.job_name }} -n duploservices-dev --timeout=30s
+            echo "✅ Old job deleted."
+          else
+            echo "No existing job found. Proceeding."
           fi
 
+          # Prepare File
           cp $TEMPLATE_FILE $FINAL_MANIFEST
 
-          # Replace {{JOB_NAME}}
+          # Replace Placeholders (Using simple placeholders)
           sed -i "s/{{JOB_NAME}}/${{ inputs.job_name }}/g" $FINAL_MANIFEST
-
-          # Replace {{OUTPUT_DIR}}
           sed -i "s|{{OUTPUT_DIR}}|$OUTPUT_DIR|g" $FINAL_MANIFEST
 
           echo "Manifest generated successfully."
-          cat $FINAL_MANIFEST
 
       - name: Debug Identity
         run: aws sts get-caller-identity
@@ -207,7 +201,7 @@ jobs:
           kubectl get pods -n duploservices-dev -l training.kubeflow.org/job-name=${{ inputs.job_name }}
 
       # ---------------------------------------------------------
-      # NEW STEP 2: Wait for Completion
+      # STEP 3: Wait for Completion
       # ---------------------------------------------------------
       - name: Wait for Simulation Completion
         run: |
